@@ -146,6 +146,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local helper scripts
+scripts/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
