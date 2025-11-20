@@ -142,6 +142,7 @@ cython_debug/
 .pypirc
 
 # Cursor metadata
+.cursor/
 .cursorignore
 .cursorindexingignore
 
