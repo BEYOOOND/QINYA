@@ -1,0 +1,8 @@
+# 推荐使用 Python 3.10 或 3.11
+# 如果使用 Python 3.14，请使用 requirements_py314.txt
+
+opencv-python>=4.8.0
+Pillow>=10.0.0
+PyQt5>=5.15.0
+numpy>=1.24.0
+pyinstaller>=6.0.0
