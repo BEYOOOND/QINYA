@@ -4,7 +4,7 @@ GUI界面模块
 
 开发人员：张诗浩 (Shihao Z)
 公司：湖南度尚文化创意有限公司
-日期：2025-11-16
+日期：2025-11-20
 """
 import sys
 import os
@@ -746,7 +746,7 @@ class CanvasLabel(QLabel):
                     "top": 114,
                     "width": 957,
                     "height": 1584,
-                    "caption": "蓝色框为封面挂件编辑区"  # 第一步页面保留文字标注
+                    "caption": "蓝色框为封面图挂件编辑区"  # 第一步页面保留文字标注
                 },
                 {
                     "color": QColor(76, 175, 80),
@@ -2270,6 +2270,7 @@ class ImageLabel(QLabel):
         painter.setPen(pendant_pen)
         painter.setBrush(Qt.NoBrush)
         painter.drawRect(pendant_display)
+        non_edit_display = None
         if non_edit_rect:
             non_edit_display = self._image_rect_to_display(non_edit_rect, offset_x, offset_y)
             if non_edit_display:
@@ -2278,7 +2279,9 @@ class ImageLabel(QLabel):
                 painter.setPen(non_edit_pen)
                 painter.drawRect(non_edit_display)
         if self.inverse_overlay_active:
-            self._paint_inverse_ring_preview(painter, pendant_display, red_display)
+            inner_display = non_edit_display if non_edit_display else red_display
+            if inner_display:
+                self._paint_inverse_ring_preview(painter, pendant_display, inner_display)
 
     def _paint_inverse_ring_preview(self, painter: QPainter, outer_rect: QRect, inner_rect: QRect):
         """绘制反选抠除区域的实时指示（仅描边，无亮度改动）"""
@@ -4061,7 +4064,7 @@ class ProcessingThread(QThread):
                  start_time, end_time, target_fps, resize_crop, 
                  watermarks=None, canvas_size=None, background_colors=None, max_size_bytes: int = 300 * 1024,
                  background_tolerance: int = 30, inverse_inner_rect=None,
-                 inverse_overlay_outer_rect=None, inverse_overlay_inner_rect=None,
+                 pendant_inner_rect=None, inverse_overlay_outer_rect=None, inverse_overlay_inner_rect=None,
                  filename_base: str = None, default_white_enabled: bool = True):
         super().__init__()
         self.processor = processor
@@ -4079,6 +4082,7 @@ class ProcessingThread(QThread):
         self.max_size_bytes = max_size_bytes
         self.background_tolerance = background_tolerance
         self.inverse_inner_rect = inverse_inner_rect
+        self.pendant_inner_rect = pendant_inner_rect
         self.inverse_overlay_outer_rect = inverse_overlay_outer_rect
         self.inverse_overlay_inner_rect = inverse_overlay_inner_rect
         self.filename_base = filename_base  # 静态图片模式的文件名基础（如"封面图"、"气泡图"等）
@@ -4127,6 +4131,39 @@ class ProcessingThread(QThread):
             if ix2 > ix and iy2 > iy:
                 mask[iy:iy2, ix:ix2] = 0
         return mask
+
+    @staticmethod
+    def _apply_mask(image, mask_bool):
+        if image is None:
+            return None
+        if mask_bool is None:
+            return np.zeros_like(image)
+        masked = np.zeros_like(image)
+        masked[mask_bool, :3] = image[mask_bool, :3]
+        masked[mask_bool, 3] = image[mask_bool, 3]
+        return masked
+
+    @staticmethod
+    def _alpha_over(base, overlay):
+        if base is None:
+            return np.copy(overlay) if overlay is not None else None
+        if overlay is None:
+            return np.copy(base)
+        result = base.copy()
+        overlay_alpha = overlay[:, :, 3:4].astype(np.float32) / 255.0
+        if not np.any(overlay_alpha):
+            return result
+        inv_alpha = 1.0 - overlay_alpha
+        result_rgb = result[:, :, :3].astype(np.float32)
+        overlay_rgb = overlay[:, :, :3].astype(np.float32)
+        result_alpha = result[:, :, 3:4].astype(np.float32)
+        result[:, :, :3] = np.clip(
+            overlay_rgb * overlay_alpha + result_rgb * inv_alpha, 0, 255
+        ).astype(np.uint8)
+        result[:, :, 3:4] = np.clip(
+            overlay[:, :, 3:4].astype(np.float32) + result_alpha * inv_alpha, 0, 255
+        ).astype(np.uint8)
+        return result
     
     def run(self):
         """执行处理"""
@@ -4195,15 +4232,21 @@ class ProcessingThread(QThread):
                         rect[3] * scale_y
                     )
 
+                color_ring_mask = None
                 if self.inverse:
                     full_rect = (0, 0, cropped.shape[1], cropped.shape[0])
-                    scaled_red = scale_rect(self.inverse_inner_rect)
+                    scaled_color_inner = scale_rect(self.inverse_inner_rect)
+                    color_ring_mask = self._build_ring_mask_local(
+                        cropped.shape[1], cropped.shape[0], full_rect, scaled_color_inner
+                    )
+                    scaled_pendant_inner = scale_rect(self.pendant_inner_rect) if self.pendant_inner_rect else scaled_color_inner
                     ring_mask_a = self._build_ring_mask_local(
-                        cropped.shape[1], cropped.shape[0], full_rect, scaled_red
+                        cropped.shape[1], cropped.shape[0], full_rect, scaled_pendant_inner
                     )
 
                 export_rgba = self._ensure_rgba(cropped)
-                base_rgba = export_rgba.copy()
+                base_layer = export_rgba.copy()
+                watermark_layer = np.zeros_like(base_layer)
                 
                 # 第五步：移除挂件外侧背景颜色（仅反选时，且只作用于主画面）
                 if self.inverse:
@@ -4217,14 +4260,14 @@ class ProcessingThread(QThread):
                             color = sel
                         if color and tuple(color) not in colors_to_remove:
                             colors_to_remove.append(tuple(color))
-                    if ring_mask_a is not None:
-                        valid_mask = np.ascontiguousarray((ring_mask_a > 0).astype(np.uint8) * 255)
+                    if color_ring_mask is not None:
+                        valid_mask = np.ascontiguousarray((color_ring_mask > 0).astype(np.uint8) * 255)
                     else:
                         rect_x = int(round(self.rect[0] * scale_x))
                         rect_y = int(round(self.rect[1] * scale_y))
                         rect_w = int(round(self.rect[2] * scale_x))
                         rect_h = int(round(self.rect[3] * scale_y))
-                        valid_mask = np.ones((base_rgba.shape[0], base_rgba.shape[1]), dtype=np.uint8) * 255
+                        valid_mask = np.ones((base_layer.shape[0], base_layer.shape[1]), dtype=np.uint8) * 255
                         x_end = min(valid_mask.shape[1], rect_x + rect_w)
                         y_end = min(valid_mask.shape[0], rect_y + rect_h)
                         rect_x = max(0, rect_x)
@@ -4238,11 +4281,9 @@ class ProcessingThread(QThread):
                             if isinstance(color_item, dict) and tuple(color_item["color"]) == tuple(sel):
                                     tolerance = color_item.get("tolerance", self.background_tolerance)
                                     break
-                        base_rgba = self.processor.remove_background_color(
-                            base_rgba, sel, tolerance=tolerance, valid_mask=valid_mask
+                        base_layer = self.processor.remove_background_color(
+                            base_layer, sel, tolerance=tolerance, valid_mask=valid_mask
                         )
-                
-                result_rgba = base_rgba
                 
                 # 第四步：添加素材（如果存在）
                 if self.watermarks:
@@ -4269,23 +4310,27 @@ class ProcessingThread(QThread):
                         else:
                             adjusted_wm_x = int(wm_x)
                             adjusted_wm_y = int(wm_y)
-                        result_rgba = self.processor.add_watermark(
-                            result_rgba, watermark_img,
+                        watermark_layer = self.processor.add_watermark(
+                            watermark_layer, watermark_img,
                             adjusted_wm_x, adjusted_wm_y,
                             wm_scale,
                             float(wm_data.get("angle", 0.0))
                         )
                 
                 if self.inverse:
+                    base_mask_bool = (color_ring_mask > 0) if color_ring_mask is not None else None
+                    base_masked = self._apply_mask(base_layer, base_mask_bool)
                     if ring_mask_a is not None and np.any(ring_mask_a):
-                        mask_a = ring_mask_a > 0
-                        masked = np.zeros_like(result_rgba)
-                        masked[mask_a, :3] = result_rgba[mask_a, :3]
-                        masked[mask_a, 3] = result_rgba[mask_a, 3]
-                        result_rgba = masked
+                        pendant_mask_bool = ring_mask_a > 0
+                        watermark_masked = self._apply_mask(watermark_layer, pendant_mask_bool)
                     else:
-                        result_rgba = np.zeros_like(result_rgba)
-                cropped = result_rgba
+                        watermark_masked = np.zeros_like(watermark_layer)
+                else:
+                    base_masked = base_layer
+                    watermark_masked = watermark_layer
+                
+                result_rgba = self._alpha_over(base_masked, watermark_masked)
+                cropped = result_rgba if result_rgba is not None else np.zeros_like(base_layer)
                 
                 # 保存
                 if self.filename_base:
@@ -6216,7 +6261,6 @@ class VideoProcessorGUI(QMainWindow):
             processed[:, :, 3] = 255
 
             a_ring_mask = np.zeros((h, w), dtype=np.uint8)
-            b_ring_mask = np.zeros((h, w), dtype=np.uint8)
 
             def apply_ring(mask_arr, outer, inner, value=1):
                 if not outer:
@@ -6236,8 +6280,8 @@ class VideoProcessorGUI(QMainWindow):
                     if ix1 < ix2 and iy1 < iy2:
                         mask_arr[iy1:iy2, ix1:ix2] = 0
 
-            apply_ring(a_ring_mask, pendant_scaled, red_scaled, value=1)
-            apply_ring(b_ring_mask, red_scaled, non_edit_scaled, value=1)
+            inner_target_scaled = non_edit_scaled if non_edit_scaled else red_scaled
+            apply_ring(a_ring_mask, pendant_scaled, inner_target_scaled, value=1)
 
             if pendant_scaled:
                 ox = max(0, pendant_scaled[0])
@@ -6247,11 +6291,11 @@ class VideoProcessorGUI(QMainWindow):
                 if ox < ox2 and oy < oy2:
                     roi = processed[oy:oy2, ox:ox2].copy()
                     roi_mask = np.ones((oy2 - oy, ox2 - ox), dtype=np.uint8) * 255
-                    if red_scaled:
-                        ix = max(0, red_scaled[0] - ox)
-                        iy = max(0, red_scaled[1] - oy)
-                        ix2 = min(roi_mask.shape[1], ix + red_scaled[2])
-                        iy2 = min(roi_mask.shape[0], iy + red_scaled[3])
+                    if inner_target_scaled:
+                        ix = max(0, inner_target_scaled[0] - ox)
+                        iy = max(0, inner_target_scaled[1] - oy)
+                        ix2 = min(roi_mask.shape[1], ix + inner_target_scaled[2])
+                        iy2 = min(roi_mask.shape[0], iy + inner_target_scaled[3])
                         if ix < ix2 and iy < iy2:
                             roi_mask[iy:iy2, ix:ix2] = 0
                     for color in colors_to_remove:
@@ -6261,7 +6305,7 @@ class VideoProcessorGUI(QMainWindow):
                         )
                     processed[oy:oy2, ox:ox2] = roi
             else:
-                mask = ((a_ring_mask + b_ring_mask) > 0).astype(np.uint8) * 255
+                mask = (a_ring_mask > 0).astype(np.uint8) * 255
                 for color in colors_to_remove:
                     tolerance = color_tolerances.get(tuple(color), self.background_tolerance)
                     processed = self.processor.remove_background_color(
@@ -6319,6 +6363,7 @@ class VideoProcessorGUI(QMainWindow):
             size_type = self.size_combo.currentText()
             selection_rect = (x, y, width, height)
             inverse_inner_rect = None
+            pendant_inner_rect = None
             inverse_overlay_outer_rect = None
             inverse_overlay_inner_rect = None
             rect_for_processing = selection_rect
@@ -6339,8 +6384,10 @@ class VideoProcessorGUI(QMainWindow):
 
                 local_red = to_local(red_rect)
                 local_non_edit = to_local(non_editable_rect)
+                pendant_ring_local = local_non_edit or local_red
                 inverse_inner_rect = local_red
-                inverse_overlay_outer_rect = local_red
+                pendant_inner_rect = pendant_ring_local
+                inverse_overlay_outer_rect = pendant_ring_local
                 inverse_overlay_inner_rect = local_non_edit
             elif self.dual_frame_mode and size_type == "封面图":
                 cover_size = self.DEFAULT_SIZES.get("封面图", (957, 1278))
@@ -6352,7 +6399,7 @@ class VideoProcessorGUI(QMainWindow):
             
             # 如果反选，使用"封面图外挂"文件名
             if inverse:
-                filename_base = "封面图外挂"
+                filename_base = "封面图挂件"
                 target_size = (1053, 1746)
             else:
                 filename_base = size_type
@@ -6459,6 +6506,7 @@ class VideoProcessorGUI(QMainWindow):
                     resize_crop, watermark_items, canvas_size,
                     background_colors, max_size_bytes, self.background_tolerance,
                     inverse_inner_rect=inverse_inner_rect,
+                    pendant_inner_rect=pendant_inner_rect,
                     inverse_overlay_outer_rect=inverse_overlay_outer_rect,
                     inverse_overlay_inner_rect=inverse_overlay_inner_rect,
                     filename_base=filename_base if self.is_image_mode else None,

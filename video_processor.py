@@ -247,7 +247,7 @@ class VideoProcessor:
     
     def crop_frame_ring(self, frame: np.ndarray, outer_rect, inner_rect):
         """
-        生成封面挂件环形区域（保留外框与内框之间的区域）
+        生成封面图挂件环形区域（保留外框与内框之间的区域）
         返回带透明通道的图像以及环形区域掩码
         """
         h, w = frame.shape[:2]
