@@ -170,3 +170,9 @@ test_output/
 
 # Misc
 .DS_Store
+
+# Release files
+庆雅神器-v*.exe
+庆雅神器-v*.zip
+RELEASE_*.md
+CREATE_RELEASE.md
