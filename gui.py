@@ -1426,7 +1426,7 @@ class ModeSelectionDialog(QDialog):
         bottom_layout.addStretch()
         
         # 右侧：版权信息（底部右侧，优化：13px，颜色#9CA3AF，使用·分隔符）
-        copyright_label = QLabel("湖南度尚文化创意有限公司 · 版本 v1.5")
+        copyright_label = QLabel("湖南度尚文化创意有限公司 · 版本 v1.6-beta")
         copyright_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         copyright_label.setObjectName("copyright")
         # 字号13px，字重400
@@ -4065,7 +4065,7 @@ class ProcessingThread(QThread):
                  watermarks=None, canvas_size=None, background_colors=None, max_size_bytes: int = 300 * 1024,
                  background_tolerance: int = 30, inverse_inner_rect=None,
                  pendant_inner_rect=None, inverse_overlay_outer_rect=None, inverse_overlay_inner_rect=None,
-                 filename_base: str = None, default_white_enabled: bool = True):
+                 filename_base: str = None, default_white_enabled: bool = True, watermark_scope_mode: str = "universal"):
         super().__init__()
         self.processor = processor
         self.output_dir = output_dir
@@ -4087,6 +4087,7 @@ class ProcessingThread(QThread):
         self.inverse_overlay_inner_rect = inverse_overlay_inner_rect
         self.filename_base = filename_base  # 静态图片模式的文件名基础（如"封面图"、"气泡图"等）
         self.default_white_enabled = bool(default_white_enabled)
+        self.watermark_scope_mode = watermark_scope_mode  # 当前选择的素材模块："universal"、"common" 或 "pendant"
         self._stop_requested = False
     
     def request_stop(self):
@@ -4246,7 +4247,11 @@ class ProcessingThread(QThread):
 
                 export_rgba = self._ensure_rgba(cropped)
                 base_layer = export_rgba.copy()
-                watermark_layer = np.zeros_like(base_layer)
+                
+                # 第四步：添加素材（如果存在）
+                # 分别处理不同 scope 的素材，以便应用不同的 mask
+                watermark_layer_pendant = np.zeros_like(base_layer)
+                watermark_layer_universal = np.zeros_like(base_layer)
                 
                 # 第五步：移除挂件外侧背景颜色（仅反选时，且只作用于主画面）
                 if self.inverse:
@@ -4286,11 +4291,13 @@ class ProcessingThread(QThread):
                         )
                 
                 # 第四步：添加素材（如果存在）
+                # 分别处理不同 scope 的素材，以便应用不同的 mask
                 if self.watermarks:
                     for wm_data in self.watermarks:
                         watermark_img = wm_data.get("image")
                         if watermark_img is None:
                             continue
+                        wm_scope = wm_data.get("scope", "common")
                         wm_scale = float(wm_data.get("scale", 1.0))
                         if self.inverse:
                             wm_x = int(wm_data.get("x", 0)) - int(self.rect[0])
@@ -4310,24 +4317,126 @@ class ProcessingThread(QThread):
                         else:
                             adjusted_wm_x = int(wm_x)
                             adjusted_wm_y = int(wm_y)
-                        watermark_layer = self.processor.add_watermark(
-                            watermark_layer, watermark_img,
-                            adjusted_wm_x, adjusted_wm_y,
-                            wm_scale,
-                            float(wm_data.get("angle", 0.0))
-                        )
+                        
+                        # 根据素材的 scope 添加到对应的 layer
+                        if wm_scope == "pendant":
+                            watermark_layer_pendant = self.processor.add_watermark(
+                                watermark_layer_pendant, watermark_img,
+                                adjusted_wm_x, adjusted_wm_y,
+                                wm_scale,
+                                float(wm_data.get("angle", 0.0))
+                            )
+                        elif wm_scope == "universal":
+                            watermark_layer_universal = self.processor.add_watermark(
+                                watermark_layer_universal, watermark_img,
+                                adjusted_wm_x, adjusted_wm_y,
+                                wm_scale,
+                                float(wm_data.get("angle", 0.0))
+                            )
+                        else:
+                            # 其他 scope 的素材，添加到 universal layer（兼容处理）
+                            watermark_layer_universal = self.processor.add_watermark(
+                                watermark_layer_universal, watermark_img,
+                                adjusted_wm_x, adjusted_wm_y,
+                                wm_scale,
+                                float(wm_data.get("angle", 0.0))
+                            )
                 
                 if self.inverse:
+                    # 主画面（base_layer）始终使用基于957x1584的mask（color_ring_mask）
+                    # color_ring_mask基于inverse_inner_rect（957x1584）创建，确保主画面正确裁切为957x1584到1053x1746之间
                     base_mask_bool = (color_ring_mask > 0) if color_ring_mask is not None else None
                     base_masked = self._apply_mask(base_layer, base_mask_bool)
-                    if ring_mask_a is not None and np.any(ring_mask_a):
-                        pendant_mask_bool = ring_mask_a > 0
-                        watermark_masked = self._apply_mask(watermark_layer, pendant_mask_bool)
+                    
+                    # 素材（watermark_layer）的mask根据当前选择的素材模块（watermark_scope_mode）决定：
+                    # - 当素材模块为"挂件"（watermark_scope_mode == "pendant"）时：
+                    #   * scope 为 "pendant" 的素材：使用861x1308到1053x1746之间的区域
+                    #   * scope 为 "universal" 的素材：使用957x1584到1053x1746之间的区域
+                    # - 当素材模块为"通用"（watermark_scope_mode == "universal"）时：
+                    #   * 所有素材都使用957x1584到1053x1746之间的区域
+                    # 注意：为了确保稳定性，无论 watermark_scope_mode 的值如何，都根据素材的实际 scope 来决定 mask
+                    target_w, target_h = base_layer.shape[1], base_layer.shape[0]
+                    # 计算缩放比例（基于1053x1746）
+                    original_pendant_w, original_pendant_h = 1053, 1746
+                    scale_w = target_w / original_pendant_w
+                    scale_h = target_h / original_pendant_h
+                    full_rect = (0, 0, target_w, target_h)
+                    
+                    # 检查是否有 "pendant" scope 的素材
+                    has_pendant_scope = watermark_layer_pendant is not None and np.any(watermark_layer_pendant)
+                    has_universal_scope = watermark_layer_universal is not None and np.any(watermark_layer_universal)
+                    
+                    # 反选模式下，素材的mask应用逻辑：
+                    # 1. 当素材模块为"通用"（watermark_scope_mode == "universal"）时：
+                    #    - 所有素材都使用957x1584到1053x1746之间的区域（无论素材的 scope 是什么）
+                    # 2. 当素材模块为"挂件"（watermark_scope_mode == "pendant"）或其他时：
+                    #    - scope 为 "pendant" 的素材：使用861x1308到1053x1746之间的区域
+                    #    - scope 为 "universal" 的素材：使用957x1584到1053x1746之间的区域
+                    # 注意：为了确保稳定性，当素材模块不是"通用"时，始终根据素材的实际 scope 来决定 mask
+                    if self.watermark_scope_mode == "universal":
+                        # 当素材模块为"通用"时，所有素材都使用957x1584到1053x1746之间的区域（无论素材的 scope 是什么）
+                        # 合并所有素材到一个 layer
+                        watermark_layer_all = self._alpha_over(watermark_layer_pendant, watermark_layer_universal)
+                        
+                        # 使用957x1584的mask
+                        inner_w, inner_h = 957, 1584
+                        inner_offset_x, inner_offset_y = 48, 114
+                        inner_scaled_w = inner_w * scale_w
+                        inner_scaled_h = inner_h * scale_h
+                        inner_scaled_x = inner_offset_x * scale_w
+                        inner_scaled_y = inner_offset_y * scale_h
+                        inner_rect_957 = (inner_scaled_x, inner_scaled_y, inner_scaled_w, inner_scaled_h)
+                        universal_mask_957 = self._build_ring_mask_local(
+                            target_w, target_h, full_rect, inner_rect_957
+                        )
+                        universal_mask_bool = (universal_mask_957 > 0) if universal_mask_957 is not None else None
+                        watermark_masked = self._apply_mask(watermark_layer_all, universal_mask_bool)
                     else:
-                        watermark_masked = np.zeros_like(watermark_layer)
+                        # 当素材模块为"挂件"或其他时，根据每个素材的实际 scope 决定使用哪个 mask
+                        # 这是关键：无论 watermark_scope_mode 的值如何（只要不是 "universal"），
+                        # 都根据素材的实际 scope 来决定 mask，确保挂件素材（scope="pendant"）始终使用861x1308的mask
+                        
+                        # 处理 "pendant" scope 的素材：使用861x1308的mask
+                        if has_pendant_scope:
+                            inner_w, inner_h = 861, 1308
+                            inner_offset_x, inner_offset_y = 96, 342
+                            inner_scaled_w = inner_w * scale_w
+                            inner_scaled_h = inner_h * scale_h
+                            inner_scaled_x = inner_offset_x * scale_w
+                            inner_scaled_y = inner_offset_y * scale_h
+                            inner_rect_861 = (inner_scaled_x, inner_scaled_y, inner_scaled_w, inner_scaled_h)
+                            pendant_mask_861 = self._build_ring_mask_local(
+                                target_w, target_h, full_rect, inner_rect_861
+                            )
+                            pendant_mask_bool = (pendant_mask_861 > 0) if pendant_mask_861 is not None else None
+                            watermark_masked_pendant = self._apply_mask(watermark_layer_pendant, pendant_mask_bool)
+                        else:
+                            watermark_masked_pendant = np.zeros_like(base_layer)
+                        
+                        # 处理 "universal" scope 的素材：使用957x1584的mask
+                        if has_universal_scope:
+                            inner_w, inner_h = 957, 1584
+                            inner_offset_x, inner_offset_y = 48, 114
+                            inner_scaled_w = inner_w * scale_w
+                            inner_scaled_h = inner_h * scale_h
+                            inner_scaled_x = inner_offset_x * scale_w
+                            inner_scaled_y = inner_offset_y * scale_h
+                            inner_rect_957 = (inner_scaled_x, inner_scaled_y, inner_scaled_w, inner_scaled_h)
+                            universal_mask_957 = self._build_ring_mask_local(
+                                target_w, target_h, full_rect, inner_rect_957
+                            )
+                            universal_mask_bool = (universal_mask_957 > 0) if universal_mask_957 is not None else None
+                            watermark_masked_universal = self._apply_mask(watermark_layer_universal, universal_mask_bool)
+                        else:
+                            watermark_masked_universal = np.zeros_like(base_layer)
+                        
+                        # 合并两个素材层
+                        watermark_masked = self._alpha_over(watermark_masked_pendant, watermark_masked_universal)
                 else:
                     base_masked = base_layer
-                    watermark_masked = watermark_layer
+                    # 非反选情况下，合并所有素材
+                    watermark_layer_all = self._alpha_over(watermark_layer_pendant, watermark_layer_universal)
+                    watermark_masked = watermark_layer_all
                 
                 result_rgba = self._alpha_over(base_masked, watermark_masked)
                 cropped = result_rgba if result_rgba is not None else np.zeros_like(base_layer)
@@ -4396,8 +4505,8 @@ class VideoProcessorGUI(QMainWindow):
     NON_EDITABLE_OFFSET = (96, 342)  # 相对挂件框左上角的偏移
     NON_EDITABLE_SIZE = (861, 1308)
     WATERMARK_SCOPES = {
-        "universal": "封面图 + 挂件（自动沿挂件图框分割）",
-        "common": "封面图 / 封面故事 / 气泡图",
+        "universal": "封面图 / 封面故事 / 气泡图 / 挂件（所有尺寸预设）",
+        "common": "封面图",
         "pendant": "封面图外挂（反选导出）"
     }
     
@@ -5184,7 +5293,7 @@ class VideoProcessorGUI(QMainWindow):
         footer_layout.addStretch()
         
         # 页脚文字（居中）
-        footer = QLabel("湖南度尚文化创意有限公司  |  版本 v1.5")
+        footer = QLabel("湖南度尚文化创意有限公司  |  版本 v1.6-beta")
         footer.setAlignment(Qt.AlignCenter)
         footer.setFixedHeight(scaler.scale(24))
         footer_layout.addWidget(footer)
@@ -5247,6 +5356,31 @@ class VideoProcessorGUI(QMainWindow):
         if scope_value in self.WATERMARK_SCOPES:
             return scope_value
         return "common"
+    
+    def _get_effective_watermark_scope_mode(self, inverse: bool) -> str:
+        """获取有效的素材模块模式
+        在反选模式下，如果有"pendant" scope的素材，应该使用"pendant"模式
+        否则使用当前的watermark_scope_mode
+        """
+        if not inverse:
+            return getattr(self, "watermark_scope_mode", "universal")
+        
+        # 反选模式下，检查是否有"pendant" scope的素材
+        has_pendant_material = False
+        if hasattr(self, "watermarks") and self.watermarks:
+            for wm in self.watermarks:
+                scope = self._normalize_scope_value(wm.get("scope"))
+                if scope == "pendant":
+                    has_pendant_material = True
+                    break
+        
+        # 如果有"pendant"素材，且当前模式不是"universal"，则使用"pendant"模式
+        # 这样可以确保挂件素材使用861x1308的mask
+        current_mode = getattr(self, "watermark_scope_mode", "universal")
+        if has_pendant_material and current_mode != "universal":
+            return "pendant"
+        
+        return current_mode
 
     def _get_scope_filtered_overlays(self, scope: Optional[str] = None):
         """返回指定模块下的素材索引与数据"""
@@ -5286,7 +5420,8 @@ class VideoProcessorGUI(QMainWindow):
                 "x": int(wm.get("x", 0)),
                 "y": int(wm.get("y", 0)),
                 "scale": float(wm.get("scale", 1.0)),
-                "angle": float(wm.get("angle", 0.0))
+                "angle": float(wm.get("angle", 0.0)),
+                "scope": scope_value
             })
         return items
 
@@ -6449,9 +6584,11 @@ class VideoProcessorGUI(QMainWindow):
             if inverse:
                 watermark_scopes = ("pendant", "universal")
             else:
-                watermark_scopes = ("common",)
+                # "通用"素材在所有尺寸预设下都支持
+                # "主图"素材只在封面图下支持
+                watermark_scopes = ["universal"]
                 if size_type == "封面图":
-                    watermark_scopes = ("common", "universal")
+                    watermark_scopes.append("common")
             watermark_items = self._collect_watermark_items(watermark_scopes)
             
             # 禁用按钮
@@ -6510,7 +6647,8 @@ class VideoProcessorGUI(QMainWindow):
                     inverse_overlay_outer_rect=inverse_overlay_outer_rect,
                     inverse_overlay_inner_rect=inverse_overlay_inner_rect,
                     filename_base=filename_base if self.is_image_mode else None,
-                    default_white_enabled=default_white_enabled
+                    default_white_enabled=default_white_enabled,
+                    watermark_scope_mode=self._get_effective_watermark_scope_mode(inverse)
                 )
                 
                 # 连接信号
